@@ -1,0 +1,177 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Secure Password
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Install PHP and Configure Environment
+        run: |
+          # Download PHP (latest 8.3 thread-safe version)
+          $phpVersion = "8.3.15"
+          $phpUrl = "https://windows.php.net/downloads/releases/php-$phpVersion-Win32-vs16-x64.zip"
+          $phpZip = "$env:TEMP\php.zip"
+          $phpPath = "C:\php"
+          
+          Write-Host "Downloading PHP $phpVersion..."
+          Invoke-WebRequest -Uri $phpUrl -OutFile $phpZip
+          
+          Write-Host "Extracting PHP to $phpPath..."
+          Expand-Archive -Path $phpZip -DestinationPath $phpPath -Force
+          Remove-Item $phpZip -Force
+          
+          # Copy and configure php.ini
+          Copy-Item "$phpPath\php.ini-development" "$phpPath\php.ini"
+          
+          # Enable common extensions
+          $phpIni = Get-Content "$phpPath\php.ini"
+          $phpIni = $phpIni -replace ';extension=curl', 'extension=curl'
+          $phpIni = $phpIni -replace ';extension=mbstring', 'extension=mbstring'
+          $phpIni = $phpIni -replace ';extension=openssl', 'extension=openssl'
+          $phpIni = $phpIni -replace ';extension=pdo_mysql', 'extension=pdo_mysql'
+          $phpIni = $phpIni -replace ';extension=mysqli', 'extension=mysqli'
+          $phpIni = $phpIni -replace ';extension=gd', 'extension=gd'
+          $phpIni | Set-Content "$phpPath\php.ini"
+          
+          # Add PHP to system PATH (Machine-level)
+          $currentPath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+          if ($currentPath -notlike "*$phpPath*") {
+              [Environment]::SetEnvironmentVariable(
+                  "Path",
+                  "$currentPath;$phpPath",
+                  "Machine"
+              )
+          }
+          
+          # Also add to current session PATH
+          $env:Path += ";$phpPath"
+          
+          # Verify installation
+          Write-Host "`n=== PHP INSTALLATION SUCCESSFUL ==="
+          & php -v
+          Write-Host "`nPHP Path: $phpPath"
+          Write-Host "PHP Executable: $phpPath\php.exe"
+          Write-Host "===================================`n"
+          
+          if (-not (Test-Path "$phpPath\php.exe")) {
+              Write-Error "PHP installation failed"
+              exit 1
+          }
+          
+          # Save PHP path to environment for later steps
+          echo "PHP_PATH=$phpPath" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n========================================="
+          Write-Host "=== RDP ACCESS INFORMATION ==="
+          Write-Host "========================================="
+          Write-Host "RDP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "$env:RDP_CREDS"
+          Write-Host "`n=== PHP INFORMATION ==="
+          Write-Host "PHP Version: $(& php -v | Select-Object -First 1)"
+          Write-Host "PHP Path: $env:PHP_PATH"
+          Write-Host "PHP is available in system PATH"
+          Write-Host "========================================="
+          Write-Host "`nRDP session will remain active..."
+          Write-Host "Use 'Cancel workflow' button to terminate`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active - PHP Ready"
+              Start-Sleep -Seconds 300
+          }
